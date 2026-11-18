@@ -290,6 +290,11 @@ class RecoveryEntry:
     max_attempts: int = 3
     resolved: bool = False
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # 异常组聚合扩展：恢复入口按异常组维度唯一化
+    group_no: str | None = None
+    exec_no: str | None = None
+    terminal: str = ""        # 已恢复 / 已关闭 / 已忽略；空串表示仍未关闭
+    result_note: str = ""
 
 
 class FailureRecovery:
@@ -300,6 +305,9 @@ class FailureRecovery:
         rec = store.recovery.log("step_editor", "BATC-001", "元素定位",
                                   "选择器超时未匹配")
         store.recovery.retry(rec.recovery_id)
+
+    异常聚合场景下由 AnomalyGroupManager 调用 log_group()，
+    每个活动异常组只落一条未关闭的恢复记录（恢复入口）。
     """
 
     def __init__(self) -> None:
@@ -324,37 +332,82 @@ class FailureRecovery:
             self._entries.append(entry)
             return entry
 
+    def log_group(self, module: str, group_no: str, exec_no: str,
+                  step: str, error_detail: str,
+                  max_attempts: int = 5) -> RecoveryEntry:
+        """为异常组登记恢复入口；同组重复调用不会产生第二条活动记录。"""
+        with self._lock:
+            for existing in self._entries:
+                if existing.group_no == group_no and not existing.terminal:
+                    return existing
+            self._seq += 1
+            entry = RecoveryEntry(
+                recovery_id=self._seq, module=module,
+                batch_ref=group_no, step=step,
+                error_detail=error_detail, max_attempts=max_attempts,
+                group_no=group_no, exec_no=exec_no,
+            )
+            self._entries.append(entry)
+            return entry
+
+    def find_by_group(self, group_no: str) -> RecoveryEntry | None:
+        with self._lock:
+            for e in self._entries:
+                if e.group_no == group_no:
+                    return e
+            return None
+
+    def active_entries(self) -> list[RecoveryEntry]:
+        """仍未关闭的恢复记录，即当前活动恢复入口。"""
+        with self._lock:
+            return [e for e in self._entries if not e.terminal]
+
     def retry(self, recovery_id: int) -> tuple[bool, str]:
         with self._lock:
             for e in self._entries:
                 if e.recovery_id == recovery_id:
+                    if e.terminal:
+                        return False, f"恢复入口已{e.terminal}，不再处理该异常组"
                     if e.resolved:
                         return False, "已恢复，无需重试"
+                    if e.attempt >= e.max_attempts:
+                        return False, (
+                            f"重试已中断：异常组 {e.group_no or e.batch_ref} "
+                            f"已达最大重试次数 {e.max_attempts}，请人工介入"
+                        )
                     e.attempt += 1
-                    if e.attempt > e.max_attempts:
-                        return False, f"已达最大重试次数 {e.max_attempts}"
                     return True, f"重试 {e.attempt}/{e.max_attempts}"
             return False, "恢复记录不存在"
 
-    def resolve(self, recovery_id: int) -> bool:
+    def resolve(self, recovery_id: int, terminal: str = "已恢复",
+                note: str = "") -> bool:
         with self._lock:
             for e in self._entries:
                 if e.recovery_id == recovery_id:
                     e.resolved = True
+                    e.terminal = terminal
+                    if note:
+                        e.result_note = note
                     return True
             return False
 
     def pending_count(self) -> int:
         with self._lock:
-            return sum(1 for e in self._entries if not e.resolved)
+            return sum(1 for e in self._entries if not e.terminal)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            pending = sum(1 for e in self._entries if not e.resolved)
+            pending = sum(1 for e in self._entries if not e.terminal)
+            active_groups = {
+                e.group_no for e in self._entries
+                if e.group_no and not e.terminal
+            }
             return {
                 "total": len(self._entries),
                 "resolved": len(self._entries) - pending,
                 "pending": pending,
+                "active_groups": len(active_groups),
+                "active_recovery_entries": pending,
             }
 
 
